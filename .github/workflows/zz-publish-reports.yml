@@ -1,0 +1,168 @@
+name: 报告发布到 Pages
+
+on:
+  workflow_run:
+    workflows: ["每日股票分析"]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: publish-reports
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: 定位来源运行
+        id: src
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "run_id=${{ github.event.workflow_run.id }}" >> "$GITHUB_OUTPUT"
+          else
+            rid=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/00-daily-analysis.yml/runs?per_page=1" --jq '.workflow_runs[0].id')
+            echo "run_id=${rid}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 下载分析产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: analysis-reports-*
+          path: artifacts
+          merge-multiple: true
+          run-id: ${{ steps.src.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 准备站点仓库
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REMOTE="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          echo "SITE_REMOTE=${REMOTE}" >> "$GITHUB_ENV"
+          if git clone --depth 1 --branch gh-pages "$REMOTE" site 2>/dev/null; then
+            echo "已存在 gh-pages，保留历史报告"
+          else
+            rm -rf site
+            mkdir -p site
+            cd site
+            git init -q
+            git checkout -q -b gh-pages
+            git remote add origin "$REMOTE"
+          fi
+
+      - name: 生成静态页面
+        run: |
+          python3 -m pip install --quiet markdown2
+          python3 - <<'PY'
+          import os, re, glob, html, datetime
+          import markdown2
+
+          SITE = "site"
+          ART = "artifacts"
+          CSS = (
+              ":root{--bg:#f6f7f9;--card:#fff;--fg:#1c1f23;--muted:#6b7280;--line:#e5e7eb;--accent:#c0392b}"
+              "*{box-sizing:border-box}"
+              "body{margin:0;background:var(--bg);color:var(--fg);"
+              "font:15px/1.75 -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif}"
+              ".wrap{max-width:840px;margin:0 auto;padding:18px 16px 60px}"
+              "header{display:flex;justify-content:space-between;align-items:center;"
+              "margin-bottom:14px;font-size:13.5px;color:var(--muted)}"
+              "header a{color:var(--accent);text-decoration:none}"
+              ".card{background:var(--card);border:1px solid var(--line);border-radius:12px;"
+              "padding:22px 24px;box-shadow:0 1px 2px rgba(0,0,0,.05)}"
+              "h1{font-size:20px;margin:0 0 14px;padding-bottom:12px;border-bottom:2px solid var(--accent)}"
+              "h2{font-size:16.5px;margin:26px 0 10px}h3{font-size:15px;margin:20px 0 8px;color:#374151}"
+              "table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px;"
+              "display:block;overflow-x:auto}th,td{border:1px solid var(--line);padding:7px 10px;"
+              "text-align:left;white-space:nowrap}th{background:#f3f4f6;font-weight:600}"
+              "blockquote{margin:12px 0;padding:10px 14px;background:#fff8e6;"
+              "border-left:3px solid #f0b429;color:#6b5b2e;border-radius:4px}"
+              "code{background:#f3f4f6;padding:1px 5px;border-radius:4px;font-size:13px}"
+              "ul,ol{padding-left:22px}li{margin:4px 0}hr{border:0;border-top:1px solid var(--line);margin:22px 0}"
+              ".day{font-weight:600;margin:24px 0 6px;font-size:15px;color:#111}"
+              ".list{list-style:none;padding:0;margin:0}"
+              ".list li{padding:11px 0;border-bottom:1px solid var(--line);margin:0}"
+              ".list li:last-child{border:0}.list a{color:#1a56db;text-decoration:none;font-weight:500}"
+              "footer{margin-top:22px;text-align:center;font-size:12px;color:var(--muted)}"
+          )
+          SHELL = "\n".join([
+              "<!doctype html>",
+              "<html lang=\"zh-CN\"><head><meta charset=\"utf-8\">",
+              "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+              "<meta name=\"robots\" content=\"noindex,nofollow\">",
+              "<title>{{TITLE}}</title>",
+              "<style>{{CSS}}</style></head><body><div class=\"wrap\">",
+              "<header>{{NAV}}</header>",
+              "<article class=\"card\">{{BODY}}</article>",
+              "<footer>由 GitHub Actions 自动生成 · 仅供研究参考，不构成投资建议</footer>",
+              "</div></body></html>",
+          ])
+
+          def build(title, nav, body):
+              return (SHELL.replace("{{TITLE}}", title)
+                          .replace("{{CSS}}", CSS)
+                          .replace("{{NAV}}", nav)
+                          .replace("{{BODY}}", body))
+
+          files = sorted(glob.glob(os.path.join(ART, "**", "*.md"), recursive=True))
+          made = 0
+          for path in files:
+              raw = open(path, encoding="utf-8", errors="ignore").read()
+              base = os.path.splitext(os.path.basename(path))[0]
+              m = re.search(r"(20\d{6})", base)
+              day = m.group(1) if m else datetime.datetime.utcnow().strftime("%Y%m%d")
+              label = "%s-%s-%s" % (day[:4], day[4:6], day[6:])
+              h1 = re.search(r"^#\s+(.+)$", raw, re.M)
+              title = h1.group(1).strip() if h1 else base
+              body = markdown2.markdown(raw, extras=["tables", "fenced-code-blocks", "break-on-newline"])
+              slug = re.sub(r"[^\w\u4e00-\u9fff-]+", "-", base).strip("-") or "report"
+              out = os.path.join(SITE, day)
+              os.makedirs(out, exist_ok=True)
+              nav = "<a href=\"../index.html\">← 全部报告</a><span>%s</span>" % label
+              with open(os.path.join(out, slug + ".html"), "w", encoding="utf-8") as f:
+                  f.write(build(html.escape(title), nav, body))
+              made += 1
+          print("生成 %d 个报告页" % made)
+
+          groups = {}
+          for p in glob.glob(os.path.join(SITE, "20*", "*.html")):
+              rel = os.path.relpath(p, SITE).replace(os.sep, "/")
+              day = rel.split("/")[0]
+              txt = open(p, encoding="utf-8").read()
+              mm = re.search(r"<title>(.*?)</title>", txt, re.S)
+              title = html.unescape(mm.group(1)) if mm else rel
+              groups.setdefault(day, []).append((rel, title))
+
+          parts = []
+          total = 0
+          for day in sorted(groups, reverse=True):
+              parts.append("<h2 class=\"day\">%s-%s-%s</h2>" % (day[:4], day[4:6], day[6:]))
+              parts.append("<ul class=\"list\">")
+              for rel, title in sorted(groups[day]):
+                  parts.append("<li><a href=\"%s\">%s</a></li>" % (rel, html.escape(title)))
+                  total += 1
+              parts.append("</ul>")
+          if not parts:
+              parts.append("<p>暂无报告。分析工作流跑完后会自动生成页面。</p>")
+
+          nav = "<strong>📈 每日股票分析</strong><span>%d 份报告</span>" % total
+          with open(os.path.join(SITE, "index.html"), "w", encoding="utf-8") as f:
+              f.write(build("每日股票分析 · 报告归档", nav, "".join(parts)))
+          print("索引完成，共 %d 份报告" % total)
+          PY
+
+      - name: 提交并推送
+        run: |
+          cd site
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "reports: publish $(date -u '+%Y-%m-%d %H:%M UTC')" || echo "本次无变更"
+          git push origin gh-pages
